@@ -27,6 +27,17 @@ def parse_date(value: str, field: str = "日期") -> date:
         raise DomainError(f"{field}必须是 YYYY-MM-DD") from exc
 
 
+def parse_datetime(value: str, field: str = "生效时刻") -> str:
+    """Normalize a date or datetime to a UTC ISO string so lexical compare works."""
+    try:
+        dt = datetime.fromisoformat(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise DomainError(f"{field}必须是 ISO 日期或时间") from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat(timespec="seconds")
+
+
 class DomainError(Exception):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
@@ -72,7 +83,10 @@ class Database:
                     created_by TEXT NOT NULL,
                     approved_by TEXT,
                     created_at TEXT NOT NULL,
-                    approved_at TEXT
+                    approved_at TEXT,
+                    executed_by TEXT,
+                    executed_at TEXT,
+                    dispatch_version INTEGER
                 );
                 CREATE TABLE IF NOT EXISTS usage_records (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,6 +96,7 @@ class Database:
                     occurred_at TEXT NOT NULL,
                     actor TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    dispatch_version INTEGER,
                     UNIQUE(account_id, meter_event_id)
                 );
                 CREATE TABLE IF NOT EXISTS season_rules (
@@ -109,8 +124,52 @@ class Database:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS dispatch_orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    region TEXT NOT NULL,
+                    limit_amount REAL NOT NULL CHECK(limit_amount >= 0),
+                    effective_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'draft',
+                    version INTEGER NOT NULL DEFAULT 0,
+                    created_by TEXT NOT NULL,
+                    published_by TEXT,
+                    published_at TEXT,
+                    revoked_by TEXT,
+                    revoked_at TEXT,
+                    checkpoint TEXT,
+                    checkpoint_applied INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS freeze_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    dispatch_order_id INTEGER NOT NULL REFERENCES dispatch_orders(id),
+                    transfer_id INTEGER NOT NULL REFERENCES transfers(id),
+                    amount REAL NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(dispatch_order_id, transfer_id)
+                );
+                CREATE TABLE IF NOT EXISTS review_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    dispatch_order_id INTEGER NOT NULL REFERENCES dispatch_orders(id),
+                    entity_type TEXT NOT NULL,
+                    entity_id INTEGER NOT NULL,
+                    amount REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending_review',
+                    created_at TEXT NOT NULL
+                );
                 """
             )
+            # 旧库缺少调度编号等列时按结构补齐，数据编号在发布时按发布前口径回填。
+            self._ensure_column(conn, "transfers", "dispatch_version", "dispatch_version INTEGER")
+            self._ensure_column(conn, "transfers", "executed_by", "executed_by TEXT")
+            self._ensure_column(conn, "transfers", "executed_at", "executed_at TEXT")
+            self._ensure_column(conn, "usage_records", "dispatch_version", "dispatch_version INTEGER")
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
     def _audit(self, conn: sqlite3.Connection, actor: str, action: str, entity_type: str,
                entity_id: int | None, details: dict[str, Any]) -> None:
@@ -186,8 +245,28 @@ class Database:
         return row
 
     def _reserved_outgoing(self, conn: sqlite3.Connection, account_id: int) -> float:
-        row = conn.execute("SELECT COALESCE(SUM(amount),0) total FROM transfers WHERE from_account_id=? AND status='pending'", (account_id,)).fetchone()
+        # 待审、已批准未执行和被调度冻结的转让都占用转出方额度。
+        row = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) total FROM transfers WHERE from_account_id=? AND status IN ('pending','approved','frozen')",
+            (account_id,),
+        ).fetchone()
         return float(row["total"])
+
+    def _active_dispatch(self, conn: sqlite3.Connection, region: str) -> sqlite3.Row | None:
+        return conn.execute(
+            """SELECT * FROM dispatch_orders
+               WHERE region=? AND status='published' AND effective_at<=?
+               ORDER BY version DESC, id DESC LIMIT 1""",
+            (region, utcnow()),
+        ).fetchone()
+
+    def _quota_cap(self, conn: sqlite3.Connection, account: sqlite3.Row) -> tuple[float, sqlite3.Row | None]:
+        """Effective quota ceiling for an account once the dispatch order applies."""
+        order = self._active_dispatch(conn, account["region"])
+        cap = float(account["quota"])
+        if order is not None:
+            cap = min(cap, float(order["limit_amount"]))
+        return cap, order
 
     def available(self, account_id: int, as_of: str | None = None) -> dict[str, Any]:
         if as_of:
@@ -195,8 +274,12 @@ class Database:
         with self.connect() as conn:
             account = self._account_row(conn, account_id)
             reserved = self._reserved_outgoing(conn, account_id)
-            value = max(0.0, float(account["quota"]) - float(account["used"]) - reserved)
-        return {"account_id": account_id, "available": value, "reserved_outgoing": reserved, "quota": account["quota"], "used": account["used"]}
+            cap, order = self._quota_cap(conn, account)
+            value = max(0.0, cap - float(account["used"]) - reserved)
+        return {"account_id": account_id, "available": value, "reserved_outgoing": reserved,
+                "quota": account["quota"], "used": account["used"],
+                "dispatch_limit": float(order["limit_amount"]) if order else None,
+                "dispatch_version": int(order["version"]) if order else None}
 
     def create_transfer(self, actor: str, payload: dict[str, Any], role: str = "editor") -> dict[str, Any]:
         if role != "editor":
@@ -219,7 +302,8 @@ class Database:
             if not (target["valid_from"] <= effective.isoformat() <= target["valid_to"]):
                 raise DomainError("转入账户在生效日无效", 409)
             reserved = self._reserved_outgoing(conn, source_id)
-            available = float(source["quota"]) - float(source["used"]) - reserved
+            cap, order = self._quota_cap(conn, source)
+            available = cap - float(source["used"]) - reserved
             if amount > available + 1e-9:
                 raise DomainError("可用额度不足，待审批转让会预占额度", 409)
             # More critical users (smaller priority number) cannot transfer their
@@ -235,9 +319,10 @@ class Database:
                 minimum = float(source["quota"]) * float(impact["min_source_fraction"])
                 if remaining + 1e-9 < minimum:
                     raise DomainError("转让会违反下游第三方最小留存约束", 409)
+            dispatch_version = int(order["version"]) if order else None
             cur = conn.execute(
-                "INSERT INTO transfers(from_account_id,to_account_id,amount,effective_date,created_by,created_at) VALUES(?,?,?,?,?,?)",
-                (source_id, target_id, amount, effective.isoformat(), actor, utcnow()),
+                "INSERT INTO transfers(from_account_id,to_account_id,amount,effective_date,created_by,created_at,dispatch_version) VALUES(?,?,?,?,?,?,?)",
+                (source_id, target_id, amount, effective.isoformat(), actor, utcnow(), dispatch_version),
             )
             self._audit(conn, actor, "transfer.created", "transfer", cur.lastrowid,
                         {"source": source_id, "target": target_id, "amount": amount, "effective_date": effective.isoformat()})
@@ -258,12 +343,13 @@ class Database:
             source = self._account_row(conn, transfer["from_account_id"])
             target = self._account_row(conn, transfer["to_account_id"])
             amount = float(transfer["amount"])
-            # Compute against pending reservations other than this transfer.
+            # Compute against reservations other than this transfer.
             other_reserved = conn.execute(
-                "SELECT COALESCE(SUM(amount),0) total FROM transfers WHERE from_account_id=? AND status='pending' AND id<>?",
+                "SELECT COALESCE(SUM(amount),0) total FROM transfers WHERE from_account_id=? AND status IN ('pending','approved','frozen') AND id<>?",
                 (source["id"], transfer_id),
             ).fetchone()["total"]
-            available = float(source["quota"]) - float(source["used"]) - float(other_reserved)
+            cap, _order = self._quota_cap(conn, source)
+            available = cap - float(source["used"]) - float(other_reserved)
             if amount > available + 1e-9:
                 raise DomainError("审批时额度已被其他记录占用，不能批准", 409)
             impact = conn.execute(
@@ -274,13 +360,54 @@ class Database:
                 minimum = float(source["quota"]) * float(impact["min_source_fraction"])
                 if available - amount + 1e-9 < minimum:
                     raise DomainError("审批时下游最小留存约束不再满足", 409)
-            # The approved amount moves between quota balances. Keeping the
-            # movement in the quota column preserves the original allocation
-            # while making every downstream availability calculation consistent.
-            conn.execute("UPDATE accounts SET quota=quota-? WHERE id=?", (amount, source["id"]))
-            conn.execute("UPDATE accounts SET quota=quota+? WHERE id=?", (amount, target["id"]))
+            # Approval only marks the transfer approved; the quota movement happens
+            # at execution so a dispatch order can still freeze approved water.
             conn.execute("UPDATE transfers SET status='approved',approved_by=?,approved_at=? WHERE id=?", (actor, utcnow(), transfer_id))
             self._audit(conn, actor, "transfer.approved", "transfer", transfer_id, {"amount": amount})
+            row = conn.execute("SELECT * FROM transfers WHERE id=?", (transfer_id,)).fetchone()
+        return dict(row)
+
+    def execute_transfer(self, transfer_id: int, actor: str, role: str = "editor") -> dict[str, Any]:
+        if role != "editor":
+            raise DomainError("只有水权编辑人员可以执行转让", 403)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            transfer = conn.execute("SELECT * FROM transfers WHERE id=?", (transfer_id,)).fetchone()
+            if not transfer:
+                raise DomainError("转让记录不存在", 404)
+            if transfer["status"] == "frozen":
+                raise DomainError("转让已被调度令冻结，不能执行", 409)
+            if transfer["status"] != "approved":
+                raise DomainError("只有已批准未执行的转让可以执行", 409)
+            source = self._account_row(conn, transfer["from_account_id"])
+            target = self._account_row(conn, transfer["to_account_id"])
+            amount = float(transfer["amount"])
+            # Re-check against the current dispatch basis instead of the approval-time one.
+            other_reserved = conn.execute(
+                "SELECT COALESCE(SUM(amount),0) total FROM transfers WHERE from_account_id=? AND status IN ('pending','approved','frozen') AND id<>?",
+                (source["id"], transfer_id),
+            ).fetchone()["total"]
+            cap, order = self._quota_cap(conn, source)
+            available = cap - float(source["used"]) - float(other_reserved)
+            if amount > available + 1e-9:
+                raise DomainError("执行时额度不足或受调度令限制，不能执行", 409)
+            impact = conn.execute(
+                "SELECT * FROM impact_rules WHERE source_region=? AND target_region=?",
+                (source["region"], target["region"]),
+            ).fetchone()
+            if impact:
+                minimum = float(source["quota"]) * float(impact["min_source_fraction"])
+                if available - amount + 1e-9 < minimum:
+                    raise DomainError("执行时下游最小留存约束不再满足", 409)
+            # The approved amount moves between quota balances only at execution.
+            conn.execute("UPDATE accounts SET quota=quota-? WHERE id=?", (amount, source["id"]))
+            conn.execute("UPDATE accounts SET quota=quota+? WHERE id=?", (amount, target["id"]))
+            dispatch_version = int(order["version"]) if order else transfer["dispatch_version"]
+            conn.execute(
+                "UPDATE transfers SET status='executed',executed_by=?,executed_at=?,dispatch_version=? WHERE id=?",
+                (actor, utcnow(), dispatch_version, transfer_id),
+            )
+            self._audit(conn, actor, "transfer.executed", "transfer", transfer_id, {"amount": amount})
             row = conn.execute("SELECT * FROM transfers WHERE id=?", (transfer_id,)).fetchone()
         return dict(row)
 
@@ -316,7 +443,8 @@ class Database:
             if not (account["valid_from"] <= occurred.isoformat() <= account["valid_to"]):
                 raise DomainError("取水日期不在许可有效期内", 409)
             reserved = self._reserved_outgoing(conn, account_id)
-            available = float(account["quota"]) - float(account["used"]) - reserved
+            cap, order = self._quota_cap(conn, account)
+            available = cap - float(account["used"]) - reserved
             if amount > available + 1e-9:
                 raise DomainError("取水超过可用额度", 409)
             season = conn.execute("SELECT max_fraction FROM season_rules WHERE region=? AND month=?", (account["region"], occurred.month)).fetchone()
@@ -330,8 +458,9 @@ class Database:
                     raise DomainError("本次取水超过该月份的季节配额", 409)
             try:
                 cur = conn.execute(
-                    "INSERT INTO usage_records(account_id,meter_event_id,amount,occurred_at,actor,created_at) VALUES(?,?,?,?,?,?)",
-                    (account_id, meter_event_id, amount, occurred.isoformat(), actor, utcnow()),
+                    "INSERT INTO usage_records(account_id,meter_event_id,amount,occurred_at,actor,created_at,dispatch_version) VALUES(?,?,?,?,?,?,?)",
+                    (account_id, meter_event_id, amount, occurred.isoformat(), actor, utcnow(),
+                     int(order["version"]) if order else None),
                 )
             except sqlite3.IntegrityError as exc:
                 raise DomainError("计量事件已登记，不能重复计水", 409) from exc
@@ -384,13 +513,225 @@ class Database:
                     for r in rows
                 ]}
 
+    # ---- 调度令：发布、撤销、检查点恢复，共用同一份调度账 ----
+
+    def _dispatch_row(self, conn: sqlite3.Connection, order_id: int) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM dispatch_orders WHERE id=?", (order_id,)).fetchone()
+        if not row:
+            raise DomainError("调度令不存在", 404)
+        return row
+
+    def create_dispatch(self, actor: str, payload: dict[str, Any], role: str = "dispatcher") -> dict[str, Any]:
+        if role not in {"dispatcher", "supervisor"}:
+            raise DomainError("只有调度员可以创建调度令", 403)
+        region = str(payload.get("region", "")).strip()
+        if not region:
+            raise DomainError("调度令区域不能为空")
+        try:
+            limit = float(payload.get("limit_amount"))
+        except (TypeError, ValueError) as exc:
+            raise DomainError("调度限额必须是数值") from exc
+        if limit < 0:
+            raise DomainError("调度限额不能为负")
+        effective_at = parse_datetime(str(payload.get("effective_at", "")), "生效时刻")
+        with self.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO dispatch_orders(region,limit_amount,effective_at,created_by,created_at) VALUES(?,?,?,?,?)",
+                (region, limit, effective_at, actor, utcnow()),
+            )
+            self._audit(conn, actor, "dispatch.created", "dispatch_order", cur.lastrowid,
+                        {"region": region, "limit_amount": limit, "effective_at": effective_at})
+            return dict(conn.execute("SELECT * FROM dispatch_orders WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    @staticmethod
+    def _require_expected_version(order: sqlite3.Row, expected_version: Any) -> None:
+        if expected_version is None:
+            raise DomainError("必须携带预期版本号，以便发现并发提交冲突")
+        if int(order["version"]) != int(expected_version):
+            raise DomainError("调度令版本冲突：他人已先行提交，本次草稿保留", 409)
+
+    def _apply_checkpoint(self, conn: sqlite3.Connection, order: sqlite3.Row) -> None:
+        """Replay the stored checkpoint. Only idempotent UPDATEs run here, so
+        replaying after a failed write never adds freeze records or audit rows."""
+        plan = json.loads(order["checkpoint"])
+        account_ids = plan.get("account_ids", [])
+        freeze_ids = plan.get("freeze_transfer_ids", [])
+        if freeze_ids:
+            marks = ",".join("?" * len(freeze_ids))
+            conn.execute(f"UPDATE transfers SET status='frozen' WHERE status='approved' AND id IN ({marks})", freeze_ids)
+        if account_ids:
+            marks = ",".join("?" * len(account_ids))
+            # 待审转让按本次发布版本重新占用。
+            conn.execute(
+                f"UPDATE transfers SET dispatch_version=? WHERE status='pending' AND from_account_id IN ({marks})",
+                [plan["version"], *account_ids],
+            )
+            # 旧数据缺少编号时按发布前口径回填。
+            conn.execute(
+                f"UPDATE transfers SET dispatch_version=? WHERE dispatch_version IS NULL AND from_account_id IN ({marks})",
+                [plan["prev_version"], *account_ids],
+            )
+            conn.execute(
+                f"UPDATE usage_records SET dispatch_version=? WHERE dispatch_version IS NULL AND account_id IN ({marks})",
+                [plan["prev_version"], *account_ids],
+            )
+        conn.execute("UPDATE dispatch_orders SET checkpoint_applied=1 WHERE id=?", (order["id"],))
+
+    def publish_dispatch(self, order_id: int, actor: str, role: str = "dispatcher",
+                         expected_version: Any = None, updates: dict[str, Any] | None = None,
+                         fail_after_checkpoint: bool = False) -> dict[str, Any]:
+        if role not in {"dispatcher", "supervisor"}:
+            raise DomainError("只有调度员可以发布调度令", 403)
+        updates = updates or {}
+        # 第一阶段：版本校验后把发布内容、冻结记录、待复核差额和检查点一次写清。
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            order = self._dispatch_row(conn, order_id)
+            if order["status"] == "revoked":
+                raise DomainError("调度令已撤销，不能再次发布", 409)
+            self._require_expected_version(order, expected_version)
+            region = str(updates.get("region") or order["region"]).strip()
+            try:
+                limit = float(updates.get("limit_amount", order["limit_amount"]))
+            except (TypeError, ValueError) as exc:
+                raise DomainError("调度限额必须是数值") from exc
+            if limit < 0:
+                raise DomainError("调度限额不能为负")
+            effective_at = (parse_datetime(str(updates["effective_at"]), "生效时刻")
+                            if updates.get("effective_at") else order["effective_at"])
+            new_version = int(order["version"]) + 1
+            accounts = conn.execute("SELECT * FROM accounts WHERE region=?", (region,)).fetchall()
+            account_ids = [int(a["id"]) for a in accounts]
+            if account_ids:
+                marks = ",".join("?" * len(account_ids))
+                freeze_rows = conn.execute(
+                    f"SELECT id, amount FROM transfers WHERE status='approved' AND from_account_id IN ({marks})",
+                    account_ids,
+                ).fetchall()
+            else:
+                freeze_rows = []
+            prev_version = int(conn.execute(
+                "SELECT COALESCE(MAX(version),0) v FROM dispatch_orders WHERE region=? AND status='published'",
+                (region,),
+            ).fetchone()["v"])
+            # 已执行或已取水的部分保留当时依据，只把超出新限额的差额转待复核。
+            reviews = []
+            for a in accounts:
+                excess = float(a["used"]) - min(float(a["quota"]), limit)
+                if excess > 1e-9:
+                    reviews.append((int(a["id"]), round(excess, 9)))
+            plan = {"version": new_version, "region": region, "limit_amount": limit,
+                    "effective_at": effective_at, "account_ids": account_ids,
+                    "freeze_transfer_ids": [int(r["id"]) for r in freeze_rows],
+                    "prev_version": prev_version}
+            conn.execute(
+                """UPDATE dispatch_orders SET status='published',version=?,region=?,limit_amount=?,effective_at=?,
+                   published_by=?,published_at=?,checkpoint=?,checkpoint_applied=0 WHERE id=?""",
+                (new_version, region, limit, effective_at, actor, utcnow(),
+                 json.dumps(plan, ensure_ascii=False), order_id),
+            )
+            for row in freeze_rows:
+                conn.execute(
+                    "INSERT OR IGNORE INTO freeze_records(dispatch_order_id,transfer_id,amount,created_at) VALUES(?,?,?,?)",
+                    (order_id, int(row["id"]), float(row["amount"]), utcnow()),
+                )
+            for account_id, excess in reviews:
+                conn.execute(
+                    "INSERT INTO review_items(dispatch_order_id,entity_type,entity_id,amount,created_at) VALUES(?,?,?,?,?)",
+                    (order_id, "account", account_id, excess, utcnow()),
+                )
+            self._audit(conn, actor, "dispatch.published", "dispatch_order", order_id,
+                        {"version": new_version, "region": region, "limit_amount": limit,
+                         "effective_at": effective_at, "frozen_transfers": plan["freeze_transfer_ids"],
+                         "review_items": len(reviews)})
+        if fail_after_checkpoint:
+            # 模拟应用阶段写库失败：检查点已提交，等待恢复重放。
+            raise DomainError("调度令应用阶段写库失败，已保留检查点，请调用恢复接口", 500)
+        # 第二阶段：应用检查点（状态冻结、待审重占、旧数据回填）。
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._apply_checkpoint(conn, self._dispatch_row(conn, order_id))
+        return self.get_dispatch(order_id)
+
+    def revoke_dispatch(self, order_id: int, actor: str, role: str = "supervisor",
+                        expected_version: Any = None) -> dict[str, Any]:
+        if role != "supervisor":
+            raise DomainError("只有调度主管可以撤销调度令", 403)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            order = self._dispatch_row(conn, order_id)
+            if order["status"] != "published":
+                raise DomainError("调度令未发布或已撤销", 409)
+            self._require_expected_version(order, expected_version)
+            if order["checkpoint"] and not order["checkpoint_applied"]:
+                self._apply_checkpoint(conn, order)  # 先补齐未应用的检查点，保持账目一致
+            new_version = int(order["version"]) + 1
+            conn.execute(
+                "UPDATE dispatch_orders SET status='revoked',version=?,revoked_by=?,revoked_at=? WHERE id=?",
+                (new_version, actor, utcnow(), order_id),
+            )
+            frozen = conn.execute(
+                "SELECT transfer_id FROM freeze_records WHERE dispatch_order_id=?", (order_id,),
+            ).fetchall()
+            if frozen:
+                marks = ",".join("?" * len(frozen))
+                conn.execute(
+                    f"UPDATE transfers SET status='approved' WHERE status='frozen' AND id IN ({marks})",
+                    [int(r["transfer_id"]) for r in frozen],
+                )
+            self._audit(conn, actor, "dispatch.revoked", "dispatch_order", order_id,
+                        {"version": new_version,
+                         "unfrozen_transfers": [int(r["transfer_id"]) for r in frozen]})
+        return self.get_dispatch(order_id)
+
+    def recover_dispatch(self, order_id: int, actor: str, role: str = "dispatcher") -> dict[str, Any]:
+        if role not in {"dispatcher", "supervisor"}:
+            raise DomainError("只有调度员可以恢复调度令", 403)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            order = self._dispatch_row(conn, order_id)
+            if not order["checkpoint"] or order["checkpoint_applied"]:
+                return {"id": order_id, "recovered": False, "detail": "没有待恢复的检查点"}
+            self._apply_checkpoint(conn, order)
+            version = int(json.loads(order["checkpoint"])["version"])
+        return {"id": order_id, "recovered": True, "version": version}
+
+    def get_dispatch(self, order_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = self._dispatch_row(conn, order_id)
+        item = dict(row)
+        item["checkpoint"] = json.loads(row["checkpoint"]) if row["checkpoint"] else None
+        return item
+
+    def list_dispatch(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM dispatch_orders ORDER BY id DESC").fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["checkpoint"] = json.loads(row["checkpoint"]) if row["checkpoint"] else None
+            result.append(item)
+        return result
+
+    def list_freeze_records(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM freeze_records ORDER BY id DESC").fetchall()
+        return [dict(row) for row in rows]
+
+    def list_review_items(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM review_items ORDER BY id DESC").fetchall()
+        return [dict(row) for row in rows]
+
     def list_accounts(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute("SELECT * FROM accounts ORDER BY id").fetchall()
             result = []
             for row in rows:
                 item = dict(row)
-                item["available"] = max(0.0, float(row["quota"]) - float(row["used"]) - self._reserved_outgoing(conn, int(row["id"])))
+                cap, order = self._quota_cap(conn, row)
+                item["available"] = max(0.0, cap - float(row["used"]) - self._reserved_outgoing(conn, int(row["id"])))
+                item["dispatch_limit"] = float(order["limit_amount"]) if order else None
                 result.append(item)
         return result
 
@@ -459,8 +800,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send({"accounts": self.db.list_accounts()})
             if parsed.path == "/api/transfers":
                 return self._send({"transfers": self.db.list_transfers()})
+            if parsed.path == "/api/dispatch":
+                return self._send({"orders": self.db.list_dispatch()})
+            if parsed.path == "/api/review":
+                return self._send({"review": self.db.list_review_items()})
+            if parsed.path == "/api/freezes":
+                return self._send({"freezes": self.db.list_freeze_records()})
             if parsed.path == "/api/audit":
                 return self._send({"audit": self.db.audit()})
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) == 3 and parts[:2] == ["api", "dispatch"]:
+                return self._send(self.db.get_dispatch(int(parts[2])))
             if parsed.path.startswith("/api/accounts/") and parsed.path.endswith("/available"):
                 account_id = int(parsed.path.split("/")[3])
                 return self._send(self.db.available(account_id))
@@ -489,6 +839,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.approve_transfer(int(parts[2]), actor, role))
             if len(parts) == 4 and parts[:2] == ["api", "transfers"] and parts[3] == "reject":
                 return self._send(self.db.reject_transfer(int(parts[2]), actor, role))
+            if len(parts) == 4 and parts[:2] == ["api", "transfers"] and parts[3] == "execute":
+                return self._send(self.db.execute_transfer(int(parts[2]), actor, role))
+            if parts == ["api", "dispatch"]:
+                return self._send(self.db.create_dispatch(actor, body, role), 201)
+            if len(parts) == 4 and parts[:2] == ["api", "dispatch"] and parts[3] == "publish":
+                return self._send(self.db.publish_dispatch(
+                    int(parts[2]), actor, role, body.get("expected_version"), body,
+                    bool(body.get("simulate_failure"))))
+            if len(parts) == 4 and parts[:2] == ["api", "dispatch"] and parts[3] == "revoke":
+                return self._send(self.db.revoke_dispatch(int(parts[2]), actor, role, body.get("expected_version")))
+            if len(parts) == 4 and parts[:2] == ["api", "dispatch"] and parts[3] == "recover":
+                return self._send(self.db.recover_dispatch(int(parts[2]), actor, role))
             if parts == ["api", "usage"]:
                 return self._send(self.db.record_usage(actor, body, role), 201)
             raise DomainError("接口不存在", 404)

@@ -2,10 +2,16 @@
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>水资源权配置</title>
 <style>body{font:15px/1.5 system-ui,sans-serif;max-width:980px;margin:32px auto;padding:0 18px}input,select,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre{background:#f5f7f9;padding:12px;overflow:auto}small{color:#667}button{cursor:pointer}</style></head>
 <body><h1>跨区域水资源使用权</h1><p>示例账户初始化后，可查看余额、发起转让、审核，并模拟干旱分配。</p>
-<div class="card"><h2>身份</h2><input id="user" value="alice"><select id="role"><option>editor</option><option>reviewer</option><option>meter</option><option>viewer</option></select></div>
+<div class="card"><h2>身份</h2><input id="user" value="alice"><select id="role"><option>editor</option><option>reviewer</option><option>meter</option><option>viewer</option><option>dispatcher</option><option>supervisor</option></select></div>
 <div class="card"><h2>账户</h2><button onclick="getAccounts()">刷新账户</button><pre id="accounts">等待操作…</pre></div>
 <div class="card"><h2>发起转让</h2><input id="from" type="number" value="1" placeholder="转出账户"><input id="to" type="number" value="2" placeholder="转入账户"><input id="amount" type="number" value="400"><input id="date" type="date" value="2026-06-01"><button onclick="transfer()">提交审批</button><pre id="result"></pre></div>
-<div class="card"><h2>审批最新转让</h2><input id="transfer_id" type="number" placeholder="转让 ID"><button onclick="approve()">批准</button><button onclick="reject()">退回</button></div>
+<div class="card"><h2>审批最新转让</h2><input id="transfer_id" type="number" placeholder="转让 ID"><button onclick="approve()">批准</button><button onclick="reject()">退回</button><button onclick="execute()">执行</button> <small>批准后需执行才会移动额度；被调度令冻结的转让不能执行。</small></div>
+<div class="card"><h2>调度令</h2>
+<input id="d_region" value="upstream" placeholder="区域"><input id="d_limit" type="number" value="850" placeholder="限额"><input id="d_effective" type="datetime-local" value="2026-01-01T00:00"><button onclick="createDispatch()">创建草稿</button><br>
+<input id="d_id" type="number" placeholder="调度令 ID"><input id="d_version" type="number" placeholder="预期版本"><button onclick="publishDispatch()">发布</button><button onclick="revokeDispatch()">撤销</button><button onclick="recoverDispatch()">恢复</button>
+<small>发布/撤销需带预期版本号；并发提交时首份写入生效，另一方看到冲突。撤销仅调度主管可用。</small>
+<pre id="dispatch">等待操作…</pre></div>
+<div class="card"><h2>待复核差额</h2><button onclick="getReview()">刷新</button><pre id="review">等待操作…</pre></div>
 <div class="card"><h2>干旱情景</h2><input id="supply" type="number" value="1200"><input id="reduction" type="number" value="0.3" step="0.1"><button onclick="simulate()">模拟</button><pre id="drought">等待操作…</pre></div>
 <script>
 const headers=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
@@ -14,5 +20,11 @@ async function getAccounts(){try{accounts.textContent=JSON.stringify(await call(
 async function transfer(){try{result.textContent=JSON.stringify(await call('/api/transfers',{method:'POST',headers:headers(),body:JSON.stringify({from_account_id:+from.value,to_account_id:+to.value,amount:+amount.value,effective_date:date.value})}),null,2)}catch(e){result.textContent=e.message}}
 async function approve(){try{result.textContent=JSON.stringify(await call('/api/transfers/'+transfer_id.value+'/approve',{method:'POST',headers:headers(),body:'{}'}),null,2)}catch(e){result.textContent=e.message}}
 async function reject(){try{result.textContent=JSON.stringify(await call('/api/transfers/'+transfer_id.value+'/reject',{method:'POST',headers:headers(),body:'{}'}),null,2)}catch(e){result.textContent=e.message}}
+async function execute(){try{result.textContent=JSON.stringify(await call('/api/transfers/'+transfer_id.value+'/execute',{method:'POST',headers:headers(),body:'{}'}),null,2)}catch(e){result.textContent=e.message}}
+async function createDispatch(){try{dispatch.textContent=JSON.stringify(await call('/api/dispatch',{method:'POST',headers:headers(),body:JSON.stringify({region:d_region.value,limit_amount:+d_limit.value,effective_at:d_effective.value})}),null,2)}catch(e){dispatch.textContent=e.message}}
+async function publishDispatch(){try{dispatch.textContent=JSON.stringify(await call('/api/dispatch/'+d_id.value+'/publish',{method:'POST',headers:headers(),body:JSON.stringify({expected_version:+d_version.value})}),null,2)}catch(e){dispatch.textContent=e.message}}
+async function revokeDispatch(){try{dispatch.textContent=JSON.stringify(await call('/api/dispatch/'+d_id.value+'/revoke',{method:'POST',headers:headers(),body:JSON.stringify({expected_version:+d_version.value})}),null,2)}catch(e){dispatch.textContent=e.message}}
+async function recoverDispatch(){try{dispatch.textContent=JSON.stringify(await call('/api/dispatch/'+d_id.value+'/recover',{method:'POST',headers:headers(),body:'{}'}),null,2)}catch(e){dispatch.textContent=e.message}}
+async function getReview(){try{review.textContent=JSON.stringify(await call('/api/review'),null,2)}catch(e){review.textContent=e.message}}
 async function simulate(){try{drought.textContent=JSON.stringify(await call('/api/drought/simulate?supply='+supply.value+'&reduction='+reduction.value),null,2)}catch(e){drought.textContent=e.message}}
 </script></body></html>
