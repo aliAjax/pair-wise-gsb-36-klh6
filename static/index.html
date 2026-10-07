@@ -1,18 +1,61 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>水资源权配置</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:980px;margin:32px auto;padding:0 18px}input,select,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre{background:#f5f7f9;padding:12px;overflow:auto}small{color:#667}button{cursor:pointer}</style></head>
-<body><h1>跨区域水资源使用权</h1><p>示例账户初始化后，可查看余额、发起转让、审核，并模拟干旱分配。</p>
-<div class="card"><h2>身份</h2><input id="user" value="alice"><select id="role"><option>editor</option><option>reviewer</option><option>meter</option><option>viewer</option></select></div>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>水资源调度账</title>
+<style>body{font:15px/1.5 system-ui,sans-serif;max-width:1040px;margin:32px auto;padding:0 18px}input,select,button{padding:7px;margin:3px}
+.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}.card h2{margin-top:0}
+pre{background:#f5f7f9;padding:12px;overflow:auto;max-height:340px}small{color:#667}button{cursor:pointer}
+.pub{background:#1f7a4d;color:#fff;border:none;border-radius:6px}.rev{background:#b3402f;color:#fff;border:none;border-radius:6px}</style></head>
+<body><h1>跨区域水资源调度账</h1><p>调度令、账户、转让、取水、审计共用一份账：发布即重算账户可用量、按版本重新占用待审转让、冻结已批准未执行转让，已执行/已取水保留旧依据并把差额转待复核。</p>
+<div class="card"><h2>身份</h2><input id="user" value="alice"><select id="role">
+<option>editor</option><option>reviewer</option><option>meter</option><option>viewer</option>
+<option selected>dispatcher</option><option>supervisor</option></select><small>调度员发布，主管撤销。</small></div>
+
+<div class="card"><h2>调度账</h2>
+<input id="dregion" value="upstream" placeholder="区域">
+<button onclick="ledger()">查看该区域调度账</button>
+<button onclick="orders()">查看全部调度令</button>
+<pre id="ledger">等待操作…</pre></div>
+
+<div class="card"><h2>发布调度令</h2>
+<input id="pregion" value="upstream" placeholder="区域">
+<input id="pcap" type="number" value="600" placeholder="区域限额">
+<input id="pbase" type="number" value="0" placeholder="依据版本（乐观并发）">
+<input id="pmoment" placeholder="生效时刻，留空=现在">
+<button class="pub" onclick="publish()">发布</button><small>两人同版本提交时，首份生效，另一份保留为冲突草稿。</small>
+<pre id="publish"></pre></div>
+
+<div class="card"><h2>撤销调度令（主管）</h2>
+<input id="roid" type="number" placeholder="调度令 ID">
+<input id="rbase" type="number" placeholder="依据版本（可选）">
+<button class="rev" onclick="revoke()">撤销</button></div>
+
+<div class="card"><h2>差额待复核</h2><button onclick="reviews()">刷新待复核</button>
+<input id="rvid" type="number" placeholder="待复核 ID">
+<button onclick="resolve('confirmed')">确认</button>
+<button onclick="resolve('dismissed')">驳回</button><pre id="reviews">等待操作…</pre></div>
+
 <div class="card"><h2>账户</h2><button onclick="getAccounts()">刷新账户</button><pre id="accounts">等待操作…</pre></div>
 <div class="card"><h2>发起转让</h2><input id="from" type="number" value="1" placeholder="转出账户"><input id="to" type="number" value="2" placeholder="转入账户"><input id="amount" type="number" value="400"><input id="date" type="date" value="2026-06-01"><button onclick="transfer()">提交审批</button><pre id="result"></pre></div>
-<div class="card"><h2>审批最新转让</h2><input id="transfer_id" type="number" placeholder="转让 ID"><button onclick="approve()">批准</button><button onclick="reject()">退回</button></div>
+<div class="card"><h2>审批 / 执行转让</h2><input id="transfer_id" type="number" placeholder="转让 ID"><button onclick="approve()">批准</button><button onclick="reject()">退回</button><button onclick="execute()">执行</button><small>批准即占用；调度令生效期间已批准未执行先冻结，解冻后才能执行。</small></div>
 <div class="card"><h2>干旱情景</h2><input id="supply" type="number" value="1200"><input id="reduction" type="number" value="0.3" step="0.1"><button onclick="simulate()">模拟</button><pre id="drought">等待操作…</pre></div>
 <script>
 const headers=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
-async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
-async function getAccounts(){try{accounts.textContent=JSON.stringify(await call('/api/accounts'),null,2)}catch(e){accounts.textContent=e.message}}
-async function transfer(){try{result.textContent=JSON.stringify(await call('/api/transfers',{method:'POST',headers:headers(),body:JSON.stringify({from_account_id:+from.value,to_account_id:+to.value,amount:+amount.value,effective_date:date.value})}),null,2)}catch(e){result.textContent=e.message}}
-async function approve(){try{result.textContent=JSON.stringify(await call('/api/transfers/'+transfer_id.value+'/approve',{method:'POST',headers:headers(),body:'{}'}),null,2)}catch(e){result.textContent=e.message}}
-async function reject(){try{result.textContent=JSON.stringify(await call('/api/transfers/'+transfer_id.value+'/reject',{method:'POST',headers:headers(),body:'{}'}),null,2)}catch(e){result.textContent=e.message}}
-async function simulate(){try{drought.textContent=JSON.stringify(await call('/api/drought/simulate?supply='+supply.value+'&reduction='+reduction.value),null,2)}catch(e){drought.textContent=e.message}}
+async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Object.assign(Error(j.error||r.status),{payload:j});return j}
+const show=(id,p)=>document.getElementById(id).textContent=typeof p==='string'?p:JSON.stringify(p,null,2);
+async function getAccounts(){try{show('accounts',await call('/api/accounts'))}catch(e){show('accounts',e.message)}}
+async function transfer(){try{show('result',await call('/api/transfers',{method:'POST',headers:headers(),body:JSON.stringify({from_account_id:+from.value,to_account_id:+to.value,amount:+amount.value,effective_date:date.value})}))}catch(e){show('result',e.payload||e.message)}}
+async function approve(){try{show('result',await call('/api/transfers/'+transfer_id.value+'/approve',{method:'POST',headers:headers(),body:'{}'}))}catch(e){show('result',e.message)}}
+async function reject(){try{show('result',await call('/api/transfers/'+transfer_id.value+'/reject',{method:'POST',headers:headers(),body:'{}'}))}catch(e){show('result',e.message)}}
+async function execute(){try{show('result',await call('/api/transfers/'+transfer_id.value+'/execute',{method:'POST',headers:headers(),body:'{}'}))}catch(e){show('result',e.message)}}
+async function simulate(){try{show('drought',await call('/api/drought/simulate?supply='+supply.value+'&reduction='+reduction.value))}catch(e){show('drought',e.message)}}
+async function ledger(){try{show('ledger',await call('/api/dispatch/ledger?region='+encodeURIComponent(dregion.value)))}catch(e){show('ledger',e.message)}}
+async function orders(){try{show('ledger',await call('/api/dispatch/orders'))}catch(e){show('ledger',e.message)}}
+async function publish(){
+  const body={region:pregion.value,cap:+pcap.value,base_version:+pbase.value};
+  if(pmoment.value)body.effective_at=pmoment.value;
+  try{show('publish',await call('/api/dispatch/orders',{method:'POST',headers:headers(),body:JSON.stringify(body)}))}
+  catch(e){show('publish',e.payload||e.message)}
+}
+async function revoke(){try{const body=rbase.value===''?{}:{base_version:+rbase.value};show('publish',await call('/api/dispatch/orders/'+roid.value+'/revoke',{method:'POST',headers:headers(),body:JSON.stringify(body)}))}catch(e){show('publish',e.payload||e.message)}}
+async function reviews(){try{show('reviews',await call('/api/dispatch/reviews?status=pending'))}catch(e){show('reviews',e.message)}}
+async function resolve(kind){try{show('reviews',await call('/api/dispatch/reviews/'+rvid.value+'/resolve',{method:'POST',headers:headers(),body:JSON.stringify({resolution:kind})}))}catch(e){show('reviews',e.message)}}
 </script></body></html>
